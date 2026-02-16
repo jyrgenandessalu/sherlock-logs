@@ -1,0 +1,117 @@
+---
+# Filebeat role
+# Installs Filebeat on all VMs to collect and forward logs to Logstash
+
+- name: Install required packages for Filebeat
+  ansible.builtin.apt:
+    name:
+      - apt-transport-https
+      - ca-certificates
+      - wget
+    state: present
+    update_cache: yes
+  become: yes
+
+- name: Ensure keyring directory exists
+  ansible.builtin.file:
+    path: /usr/share/keyrings
+    state: directory
+    mode: '0755'
+  become: yes
+
+- name: Check if Elasticsearch GPG key already exists
+  ansible.builtin.stat:
+    path: /usr/share/keyrings/elasticsearch.gpg
+  register: elasticsearch_gpg_key
+  become: yes
+
+- name: Download Elasticsearch GPG key (if not exists)
+  ansible.builtin.get_url:
+    url: https://artifacts.elastic.co/GPG-KEY-elasticsearch
+    dest: /tmp/elasticsearch.gpg
+    mode: '0644'
+  become: yes
+  when: not elasticsearch_gpg_key.stat.exists
+
+- name: Add Elasticsearch GPG key to keyring (if not exists)
+  ansible.builtin.shell: gpg --dearmor < /tmp/elasticsearch.gpg | tee /usr/share/keyrings/elasticsearch.gpg
+  become: yes
+  args:
+    creates: /usr/share/keyrings/elasticsearch.gpg
+  when: not elasticsearch_gpg_key.stat.exists
+
+- name: Add Filebeat APT repository
+  ansible.builtin.apt_repository:
+    repo: "deb [signed-by=/usr/share/keyrings/elasticsearch.gpg] https://artifacts.elastic.co/packages/8.x/apt stable main"
+    state: present
+    filename: filebeat
+  become: yes
+
+- name: Update apt cache after adding Filebeat repository
+  ansible.builtin.apt:
+    update_cache: yes
+  become: yes
+
+- name: Install Filebeat
+  ansible.builtin.apt:
+    name: filebeat
+    state: present
+  become: yes
+  notify: restart filebeat
+
+- name: Create log directories for application logs
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: '0755'
+  become: yes
+  loop:
+    - /var/log/flask_apps
+    - /var/log/docker
+  ignore_errors: yes
+
+- name: Configure Filebeat
+  ansible.builtin.template:
+    src: filebeat.yml.j2
+    dest: /etc/filebeat/filebeat.yml
+    owner: root
+    group: root
+    mode: '0644'
+  become: yes
+  notify: restart filebeat
+
+- name: Create Filebeat log directory
+  ansible.builtin.file:
+    path: /var/log/filebeat
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+  become: yes
+
+- name: Reload systemd daemon
+  ansible.builtin.systemd:
+    daemon_reload: yes
+  become: yes
+
+- name: Enable and start Filebeat service
+  ansible.builtin.systemd:
+    name: filebeat
+    enabled: yes
+    state: started
+  become: yes
+  register: filebeat_start
+  async: 10
+  poll: 2
+
+- name: Verify Filebeat service status
+  ansible.builtin.systemd:
+    name: filebeat
+  register: filebeat_status
+  changed_when: false
+  failed_when: filebeat_status.status.ActiveState != "active"
+
+- name: Display Filebeat status
+  ansible.builtin.debug:
+    msg: "Filebeat is running on {{ ansible_hostname }} and forwarding logs to Logstash at 192.168.56.25:5044"
+

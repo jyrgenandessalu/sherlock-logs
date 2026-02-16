@@ -1,0 +1,133 @@
+---
+# Node Exporter role
+# Installs Node Exporter on all VMs to expose system metrics to Prometheus
+
+- name: Create node_exporter user
+  user:
+    name: node_exporter
+    system: yes
+    shell: /usr/sbin/nologin
+    home: /var/lib/node_exporter
+    create_home: yes
+    comment: Node Exporter for Prometheus
+  become: yes
+
+- name: Create Node Exporter directory
+  file:
+    path: /opt/node_exporter
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+  become: yes
+
+- name: Get latest Node Exporter version
+  uri:
+    url: https://api.github.com/repos/prometheus/node_exporter/releases/latest
+    return_content: yes
+  register: node_exporter_release
+  changed_when: false
+
+- name: Set Node Exporter version variable
+  set_fact:
+    node_exporter_version: "{{ node_exporter_release.json.tag_name | regex_replace('^v', '') }}"
+    node_exporter_download_url: "https://github.com/prometheus/node_exporter/releases/download/{{ node_exporter_release.json.tag_name }}/node_exporter-{{ node_exporter_release.json.tag_name[1:] }}.linux-amd64.tar.gz"
+
+- name: Download Node Exporter
+  get_url:
+    url: "{{ node_exporter_download_url }}"
+    dest: /tmp/node_exporter.tar.gz
+    mode: '0644'
+  become: yes
+  register: node_exporter_download
+
+- name: Extract Node Exporter archive
+  unarchive:
+    src: /tmp/node_exporter.tar.gz
+    dest: /tmp
+    remote_src: yes
+    creates: /tmp/node_exporter-{{ node_exporter_version }}.linux-amd64
+  become: yes
+  when: node_exporter_download.changed
+
+- name: Copy Node Exporter binary
+  copy:
+    src: "/tmp/node_exporter-{{ node_exporter_version }}.linux-amd64/node_exporter"
+    dest: /usr/local/bin/node_exporter
+    owner: root
+    group: root
+    mode: '0755'
+    remote_src: yes
+  become: yes
+  notify: restart node_exporter
+
+- name: Create Node Exporter systemd service
+  copy:
+    dest: /etc/systemd/system/node_exporter.service
+    mode: '0644'
+    content: |
+      [Unit]
+      Description=Node Exporter
+      Documentation=https://github.com/prometheus/node_exporter
+      After=network-online.target
+      Wants=network-online.target
+
+      [Service]
+      Type=simple
+      User=node_exporter
+      Group=node_exporter
+      Restart=always
+      RestartSec=5
+      ExecStart=/usr/local/bin/node_exporter \
+        --web.listen-address=0.0.0.0:9100 \
+        --path.procfs=/proc \
+        --path.sysfs=/sys \
+        --collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)
+
+      [Install]
+      WantedBy=multi-user.target
+  become: yes
+  notify: restart node_exporter
+
+- name: Reload systemd daemon
+  systemd:
+    daemon_reload: yes
+  become: yes
+
+- name: Enable and start Node Exporter service
+  systemd:
+    name: node_exporter
+    enabled: yes
+    state: started
+  become: yes
+
+- name: Allow Node Exporter port in UFW
+  ufw:
+    rule: allow
+    port: '9100'
+    proto: tcp
+  become: yes
+
+- name: Wait for Node Exporter to be ready
+  uri:
+    url: http://localhost:9100/metrics
+    method: GET
+    status_code: 200
+  register: node_exporter_ready
+  retries: 5
+  delay: 2
+  until: node_exporter_ready.status == 200
+  ignore_errors: yes
+
+- name: Verify Node Exporter is running
+  uri:
+    url: http://localhost:9100/metrics
+    method: GET
+    return_content: yes
+  register: node_exporter_metrics
+  changed_when: false
+
+- name: Display Node Exporter status
+  debug:
+    msg: "Node Exporter is running on {{ ansible_hostname }} at http://{{ ansible_default_ipv4.address }}:9100"
+

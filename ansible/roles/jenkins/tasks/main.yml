@@ -1,0 +1,601 @@
+---
+# Jenkins setup for Automation Alchemy
+# Fully automated Jenkins setup with admin user, plugins, Gitea link, and CI job
+# No manual setup wizard or hanging on first boot
+
+- name: Install Ansible for CI/CD deployments
+  apt:
+    name:
+      - ansible
+      - sshpass
+    state: present
+    update_cache: yes
+
+- name: Install Jenkins dependencies
+  apt:
+    name:
+      - openjdk-17-jdk
+      - curl
+      - gnupg
+    state: present
+    update_cache: yes
+
+- name: Set Java 17 as default
+  alternatives:
+    name: java
+    path: /usr/lib/jvm/java-17-openjdk-amd64/bin/java
+
+- name: Add Jenkins repository key
+  apt_key:
+    url: https://pkg.jenkins.io/debian-stable/jenkins.io-2023.key
+    state: present
+
+- name: Add Jenkins repository
+  apt_repository:
+    repo: 'deb https://pkg.jenkins.io/debian-stable binary/'
+    state: present
+
+- name: Install Jenkins
+  apt:
+    name: jenkins
+    state: present
+    update_cache: yes
+
+- name: Allow Jenkins port 8080 in UFW
+  ufw:
+    rule: allow
+    port: '8080'
+    proto: tcp
+  become: yes
+
+# --- Set up SSH key for Jenkins to access other VMs (after Jenkins user is created) ---
+- name: Create .ssh directory for Jenkins user
+  file:
+    path: /var/lib/jenkins/.ssh
+    state: directory
+    owner: jenkins
+    group: jenkins
+    mode: '0700'
+  when: ansible_hostname == "backup-server-auto"
+
+- name: Try to copy SSH key from lb-server-auto
+  shell: |
+    sshpass -p "vagrant" scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null vagrant@192.168.56.20:/home/vagrant/.ssh/id_ed25519 /tmp/id_ed25519 2>/dev/null || exit 1
+    # Use install to set permissions and ownership in one atomic operation
+    sudo install -m 600 -o jenkins -g jenkins /tmp/id_ed25519 /var/lib/jenkins/.ssh/id_ed25519
+    # Double-check permissions immediately after install
+    PERMS=$(stat -c "%a" /var/lib/jenkins/.ssh/id_ed25519)
+    if [ "$PERMS" != "600" ]; then
+      echo "ERROR: install command failed to set permissions correctly, got $PERMS"
+      sudo chmod 600 /var/lib/jenkins/.ssh/id_ed25519
+      sudo chown jenkins:jenkins /var/lib/jenkins/.ssh/id_ed25519
+      PERMS_FINAL=$(stat -c "%a" /var/lib/jenkins/.ssh/id_ed25519)
+      if [ "$PERMS_FINAL" != "600" ]; then
+        echo "ERROR: Failed to fix permissions, still $PERMS_FINAL"
+        exit 1
+      fi
+    fi
+    sudo rm -f /tmp/id_ed25519
+    echo "SSH key copied with correct permissions: 600"
+  args:
+    executable: /bin/bash
+  register: copy_key_result
+  ignore_errors: yes
+  when: ansible_hostname == "backup-server-auto"
+
+- name: Generate SSH key for Jenkins if copy failed
+  shell: |
+    sudo -u jenkins ssh-keygen -t ed25519 -f /var/lib/jenkins/.ssh/id_ed25519 -N "" -q
+    # Ensure permissions are correct immediately after generation
+    sudo chmod 600 /var/lib/jenkins/.ssh/id_ed25519
+    sudo chown jenkins:jenkins /var/lib/jenkins/.ssh/id_ed25519
+    PERMS=$(stat -c "%a" /var/lib/jenkins/.ssh/id_ed25519)
+    if [ "$PERMS" != "600" ]; then
+      echo "ERROR: Generated key has wrong permissions: $PERMS"
+      exit 1
+    fi
+    echo "SSH key generated with correct permissions: 600"
+  args:
+    executable: /bin/bash
+  when: 
+    - ansible_hostname == "backup-server-auto"
+    - copy_key_result.rc != 0
+
+- name: Ensure SSH key exists (verify after copy or generation)
+  stat:
+    path: /var/lib/jenkins/.ssh/id_ed25519
+  register: key_exists_check
+  when: ansible_hostname == "backup-server-auto"
+
+- name: Fail if SSH key doesn't exist
+  fail:
+    msg: "SSH key for Jenkins was not created. Check previous tasks."
+  when:
+    - ansible_hostname == "backup-server-auto"
+    - not key_exists_check.stat.exists
+
+- name: Ensure SSH key has correct permissions using Ansible file module (more reliable)
+  file:
+    path: /var/lib/jenkins/.ssh/id_ed25519
+    owner: jenkins
+    group: jenkins
+    mode: '0600'
+  when: 
+    - ansible_hostname == "backup-server-auto"
+    - key_exists_check.stat.exists
+
+- name: Verify SSH key permissions were set correctly
+  shell: |
+    PERMS=$(stat -c "%a" /var/lib/jenkins/.ssh/id_ed25519)
+    OWNER=$(stat -c "%U:%G" /var/lib/jenkins/.ssh/id_ed25519)
+    if [ "$PERMS" != "600" ]; then
+      echo "ERROR: Permissions are $PERMS, expected 600"
+      exit 1
+    fi
+    if [ "$OWNER" != "jenkins:jenkins" ]; then
+      echo "ERROR: Owner is $OWNER, expected jenkins:jenkins"
+      exit 1
+    fi
+    echo "SSH key permissions verified: $PERMS, owner: $OWNER"
+  args:
+    executable: /bin/bash
+  when: 
+    - ansible_hostname == "backup-server-auto"
+    - key_exists_check.stat.exists
+
+- name: Regenerate public key from private key (ensures keys match)
+  shell: |
+    sudo -u jenkins ssh-keygen -y -f /var/lib/jenkins/.ssh/id_ed25519 > /tmp/id_ed25519.pub
+    sudo mv /tmp/id_ed25519.pub /var/lib/jenkins/.ssh/id_ed25519.pub
+    sudo chmod 644 /var/lib/jenkins/.ssh/id_ed25519.pub
+    sudo chown jenkins:jenkins /var/lib/jenkins/.ssh/id_ed25519.pub
+    # Verify public key exists
+    if [ ! -f /var/lib/jenkins/.ssh/id_ed25519.pub ]; then
+      echo "ERROR: Failed to create public key"
+      exit 1
+    fi
+    echo "Public key created successfully"
+  args:
+    executable: /bin/bash
+  when: 
+    - ansible_hostname == "backup-server-auto"
+    - key_exists_check.stat.exists
+
+- name: Get Jenkins SSH public key
+  shell: cat /var/lib/jenkins/.ssh/id_ed25519.pub
+  register: jenkins_pub_key
+  when: ansible_hostname == "backup-server-auto"
+  changed_when: false
+
+- name: Verify public key was retrieved
+  fail:
+    msg: "Failed to retrieve Jenkins public key"
+  when:
+    - ansible_hostname == "backup-server-auto"
+    - jenkins_pub_key.stdout is not defined or jenkins_pub_key.stdout | length == 0
+
+- name: Add Jenkins public key to target servers
+  shell: |
+    PUB_KEY="{{ jenkins_pub_key.stdout }}"
+    FAILED=0
+    for ip in 192.168.56.21 192.168.56.22 192.168.56.23; do
+      echo "Adding SSH key to $ip..."
+      if sshpass -p "vagrant" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null vagrant@$ip "mkdir -p ~/.ssh && echo '$PUB_KEY' >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys && sort -u ~/.ssh/authorized_keys -o ~/.ssh/authorized_keys"; then
+        echo "Successfully added key to $ip"
+      else
+        echo "ERROR: Failed to add key to $ip"
+        FAILED=1
+      fi
+    done
+    if [ $FAILED -eq 1 ]; then
+      echo "ERROR: Failed to add SSH key to one or more servers"
+      exit 1
+    fi
+    echo "SSH key successfully added to all target servers"
+  args:
+    executable: /bin/bash
+  when: ansible_hostname == "backup-server-auto"
+
+# --- Prevent first-run setup wizard ---
+- name: Stop Jenkins immediately after install
+  systemd:
+    name: jenkins
+    state: stopped
+  ignore_errors: yes
+
+- name: Remove setup wizard state files (if they exist)
+  file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /var/lib/jenkins/jenkins.install.UpgradeWizard.state
+    - /var/lib/jenkins/jenkins.install.InstallUtil.lastExecVersion
+    - /var/lib/jenkins/secrets/initialAdminPassword
+  ignore_errors: yes
+
+- name: Write setup wizard completion markers (disable wizard)
+  copy:
+    dest: "{{ item.path }}"
+    content: "{{ item.content }}"
+    owner: jenkins
+    group: jenkins
+    mode: '0644'
+  loop:
+    - { path: '/var/lib/jenkins/jenkins.install.UpgradeWizard.state', content: '2.528.1' }
+    - { path: '/var/lib/jenkins/jenkins.install.InstallUtil.lastExecVersion', content: '2.528.1' }
+
+- name: Disable Jenkins setup wizard (before start)
+  lineinfile:
+    path: /etc/default/jenkins
+    regexp: '^JAVA_ARGS='
+    line: 'JAVA_ARGS="-Djenkins.install.runSetupWizard=false -Djenkins.CLI.disabled=false"'
+    create: yes
+
+- name: Ensure Jenkins home permissions
+  file:
+    path: /var/lib/jenkins
+    state: directory
+    owner: jenkins
+    group: jenkins
+    mode: '0755'
+    recurse: yes
+
+# --- Admin creation (BEFORE first start) ---
+- name: Ensure Groovy init directory exists
+  file:
+    path: /var/lib/jenkins/init.groovy.d
+    state: directory
+    owner: jenkins
+    group: jenkins
+    mode: '0755'
+
+- name: Create Jenkins admin user and disable setup wizard (before first start)
+  copy:
+    dest: /var/lib/jenkins/init.groovy.d/01-basic-security.groovy
+    owner: jenkins
+    group: jenkins
+    mode: '0644'
+    content: |
+      import jenkins.model.*
+      import hudson.security.*
+      import jenkins.security.*
+      import jenkins.install.*
+      import java.util.concurrent.TimeUnit
+      
+      def instance = Jenkins.getInstance()
+      
+      // Wait for Jenkins to be ready
+      while (instance.getInstallState() == InstallState.UNKNOWN) {
+        Thread.sleep(1000)
+      }
+      
+      // Disable setup wizard completely
+      if (instance.getInstallState() != InstallState.RUNNING) {
+        instance.setInstallState(InstallState.RUNNING)
+      }
+      
+      // Create security realm with admin user
+      def hudsonRealm = new HudsonPrivateSecurityRealm(false)
+      hudsonRealm.createAccount("admin", "admin")
+      instance.setSecurityRealm(hudsonRealm)
+      
+      // Set authorization strategy - use permissive strategy first
+      def strategy = new FullControlOnceLoggedInAuthorizationStrategy()
+      strategy.setAllowAnonymousRead(false)
+      instance.setAuthorizationStrategy(strategy)
+      
+      // Save configuration
+      instance.save()
+      
+      println "Jenkins admin user 'admin' created successfully"
+
+# --- Initial boot and cleanup ---
+- name: Start Jenkins service for the first time
+  systemd:
+    name: jenkins
+    state: started
+    enabled: yes
+
+- name: Restart Jenkins to ensure Groovy init script runs (for provision)
+  systemd:
+    name: jenkins
+    state: restarted
+  ignore_errors: yes
+
+- name: Wait for Jenkins initial startup (login or 403)
+  uri:
+    url: http://localhost:8080/login
+    method: GET
+    status_code: 200,403
+    timeout: 15
+  register: jenkins_up
+  retries: 20
+  delay: 10
+  until: jenkins_up.status in [200, 403]
+  ignore_errors: yes
+
+- name: Wait additional time for Groovy init scripts to complete
+  shell: sleep 30
+  args:
+    executable: /bin/bash
+
+- name: Deploy Jenkins main config (after security is set up)
+  copy:
+    src: /vagrant/ansible/roles/jenkins/files/config.xml
+    dest: /var/lib/jenkins/config.xml
+    owner: jenkins
+    group: jenkins
+    mode: '0644'
+  when: false  # Disable for now - let Groovy script handle security
+
+- name: Ensure setup wizard is marked as complete (final check)
+  copy:
+    dest: "{{ item.path }}"
+    content: "{{ item.content }}"
+    owner: jenkins
+    group: jenkins
+    mode: '0644'
+  loop:
+    - { path: '/var/lib/jenkins/jenkins.install.UpgradeWizard.state', content: '2.528.1' }
+    - { path: '/var/lib/jenkins/jenkins.install.InstallUtil.lastExecVersion', content: '2.528.1' }
+
+# --- Unified and safe Jenkins readiness check ---
+- name: Wait for Jenkins login page to be available
+  uri:
+    url: http://localhost:8080/login
+    method: GET
+    return_content: yes
+    status_code: 200,403
+    timeout: 15
+  register: jenkins_login_ready
+  retries: 12
+  delay: 15
+  until: >
+    ('content' in jenkins_login_ready and 'Login' in jenkins_login_ready.content)
+    or ('status' in jenkins_login_ready and jenkins_login_ready.status in [200, 403])
+  ignore_errors: yes
+
+# --- Plugin installation ---
+- name: Wait until Jenkins CLI endpoint is ready
+  uri:
+    url: http://localhost:8080/cli/
+    method: GET
+    status_code: 200,403
+  register: jenkins_cli
+  retries: 15
+  delay: 10
+  until: jenkins_cli.status in [200, 403]
+  ignore_errors: yes
+
+- name: Download Jenkins CLI jar
+  get_url:
+    url: http://localhost:8080/jnlpJars/jenkins-cli.jar
+    dest: /var/lib/jenkins/jenkins-cli.jar
+    mode: '0755'
+    owner: jenkins
+    group: jenkins
+  register: cli_jar_download
+  retries: 10
+  delay: 5
+  until: cli_jar_download is succeeded
+  ignore_errors: yes
+
+# --- Verify admin user and wait for authentication to be ready ---
+- name: Verify admin user can authenticate
+  shell: |
+    JENKINS_CLI="/var/lib/jenkins/jenkins-cli.jar"
+    URL="http://localhost:8080"
+    AUTH="admin:admin"
+    for i in {1..30}; do
+      if java -jar "$JENKINS_CLI" -s "$URL" -auth "$AUTH" who-am-i 2>&1 | grep -q "admin"; then
+        echo "Authentication successful"
+        exit 0
+      fi
+      echo "Waiting for authentication to be ready (attempt $i/30)..."
+      sleep 5
+    done
+    echo "Authentication failed after 30 attempts"
+    exit 1
+  args:
+    executable: /bin/bash
+  register: auth_check
+  retries: 3
+  delay: 15
+  until: auth_check.rc == 0
+  ignore_errors: yes
+
+- debug:
+    var: auth_check.stdout
+
+- name: Install Jenkins plugins via CLI
+  become: yes
+  shell: |
+    set -e
+    JENKINS_CLI="/var/lib/jenkins/jenkins-cli.jar"
+    URL="http://localhost:8080"
+    AUTH="admin:admin"
+    echo "Starting plugin installation..."
+    while IFS= read -r plugin; do
+      [ -z "$plugin" ] && continue
+      echo "Installing plugin: $plugin"
+      for attempt in {1..3}; do
+        if java -jar "$JENKINS_CLI" -s "$URL" -auth "$AUTH" install-plugin "$plugin" -deploy; then
+          echo "Successfully installed $plugin"
+          break
+        else
+          echo "Failed to install $plugin (attempt $attempt/3), retrying..."
+          sleep 5
+        fi
+      done
+    done < /vagrant/ansible/roles/jenkins/files/jenkins_plugins.txt
+  args:
+    executable: /bin/bash
+  register: plugin_install
+  retries: 2
+  delay: 10
+  until: plugin_install.rc == 0
+  ignore_errors: yes
+
+- name: Restart Jenkins after plugin install
+  systemd:
+    name: jenkins
+    state: restarted
+    enabled: yes
+
+- name: Wait for Jenkins restart completion
+  uri:
+    url: http://localhost:8080/login
+    method: GET
+    status_code: 200,403
+  register: jenkins_up
+  retries: 12
+  delay: 15
+  until: jenkins_up.status in [200, 403]
+  ignore_errors: yes
+
+# Plugin installation completed - plugins may need time to fully load
+# You can verify plugins are installed via Jenkins UI: Manage Jenkins > Plugins
+
+- name: Wait for Jenkins API to be fully ready (itemCategories endpoint)
+  uri:
+    url: http://localhost:8080/view/all/itemCategories
+    method: GET
+    status_code: 200,403
+    user: admin
+    password: admin
+  register: api_ready
+  retries: 10
+  delay: 5
+  until: api_ready.status in [200, 403]
+  ignore_errors: yes
+
+# --- Gitea credentials and Job creation ---
+- name: Create Gitea credentials via Groovy script
+  copy:
+    dest: /var/lib/jenkins/init.groovy.d/02-gitea-credentials.groovy
+    owner: jenkins
+    group: jenkins
+    mode: '0644'
+    content: |
+      import jenkins.model.*
+      import com.cloudbees.plugins.credentials.*
+      import com.cloudbees.plugins.credentials.common.*
+      import com.cloudbees.plugins.credentials.domains.*
+      import com.cloudbees.plugins.credentials.impl.*
+      
+      def instance = Jenkins.getInstance()
+      def domain = Domain.global()
+      def store = instance.getExtensionList('com.cloudbees.plugins.credentials.SystemCredentialsProvider')[0].getStore()
+      
+      def existingCred = store.getCredentials(domain).find { it.id == 'gitea-cred' }
+      if (existingCred == null) {
+        def usernamePassword = new UsernamePasswordCredentialsImpl(
+          CredentialsScope.GLOBAL,
+          'gitea-cred',
+          'Gitea Access Token',
+          'jurgenandessalu',
+          '746662f9c955dd55224dc493aaee7acf69b6c648'
+        )
+        store.addCredentials(domain, usernamePassword)
+        println "Gitea credentials created successfully"
+      } else {
+        println "Gitea credentials already exist"
+      }
+      instance.save()
+
+- name: Restart Jenkins to apply credentials
+  systemd:
+    name: jenkins
+    state: restarted
+  ignore_errors: yes
+
+- name: Wait for Jenkins after credentials setup
+  uri:
+    url: http://localhost:8080/login
+    method: GET
+    status_code: 200,403
+  register: jenkins_ready
+  retries: 15
+  delay: 10
+  until: jenkins_ready.status in [200, 403]
+  ignore_errors: yes
+
+- name: Create Jenkins job using simple freestyle job (more reliable)
+  shell: |
+    JENKINS_CLI="/var/lib/jenkins/jenkins-cli.jar"
+    URL="http://localhost:8080"
+    AUTH="admin:admin"
+    JOB_CONFIG="/vagrant/ansible/roles/jenkins/files/simple-job-config.xml"
+    
+    # Wait for Jenkins to be fully ready
+    for i in {1..30}; do
+      if java -jar "$JENKINS_CLI" -s "$URL" -auth "$AUTH" who-am-i 2>/dev/null | grep -q "admin"; then
+        echo "Jenkins is ready"
+        break
+      fi
+      sleep 2
+    done
+    
+    # Wait a bit more for plugins to fully load
+    sleep 10
+    
+    # Create the job using CLI with freestyle job config
+    for attempt in {1..5}; do
+      if java -jar "$JENKINS_CLI" -s "$URL" -auth "$AUTH" create-job "Pipeline build" < "$JOB_CONFIG" 2>&1 | grep -v "ERROR"; then
+        echo "Job created successfully"
+        exit 0
+      fi
+      echo "Failed to create job (attempt $attempt/5), retrying..."
+      sleep 5
+    done
+    echo "Job creation failed - you may need to create it manually via UI"
+    exit 1
+  args:
+    executable: /bin/bash
+  register: create_job
+  ignore_errors: yes
+
+- name: Verify job exists
+  shell: |
+    JENKINS_CLI="/var/lib/jenkins/jenkins-cli.jar"
+    URL="http://localhost:8080"
+    AUTH="admin:admin"
+    if java -jar "$JENKINS_CLI" -s "$URL" -auth "$AUTH" list-jobs 2>/dev/null | grep -q "Pipeline build"; then
+      echo "Job verified"
+      exit 0
+    else
+      echo "Job not found - will need manual creation"
+      exit 1
+    fi
+  args:
+    executable: /bin/bash
+
+- name: Final verification - Ensure SSH key permissions are correct after all operations
+  file:
+    path: /var/lib/jenkins/.ssh/id_ed25519
+    owner: jenkins
+    group: jenkins
+    mode: '0600'
+  when: ansible_hostname == "backup-server-auto"
+
+- name: Final verification - Display SSH key permissions
+  shell: |
+    if [ -f /var/lib/jenkins/.ssh/id_ed25519 ]; then
+      PERMS=$(stat -c "%a" /var/lib/jenkins/.ssh/id_ed25519)
+      OWNER=$(stat -c "%U:%G" /var/lib/jenkins/.ssh/id_ed25519)
+      echo "Final SSH key check - Permissions: $PERMS, Owner: $OWNER"
+      if [ "$PERMS" != "600" ] || [ "$OWNER" != "jenkins:jenkins" ]; then
+        echo "WARNING: SSH key permissions are incorrect!"
+        ls -la /var/lib/jenkins/.ssh/id_ed25519
+        exit 1
+      fi
+      echo "SSH key permissions are correct: 600, jenkins:jenkins"
+    else
+      echo "ERROR: SSH key does not exist!"
+      exit 1
+    fi
+  args:
+    executable: /bin/bash
+  when: ansible_hostname == "backup-server-auto"
+  register: verify_job
+  ignore_errors: yes

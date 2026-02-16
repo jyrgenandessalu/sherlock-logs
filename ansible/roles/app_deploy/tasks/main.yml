@@ -1,0 +1,67 @@
+---
+# tasks/main.yml - Deploy and run Flask application on app-server (for devops user)
+
+- name: Ensure Python and pip are installed
+  apt:
+    name:
+      - python3
+      - python3-pip
+    state: present
+    update_cache: yes
+  become: yes
+
+- name: Install Flask and prometheus-client via pip
+  pip:
+    name:
+      - flask
+      - prometheus-client
+    executable: pip3
+  become: yes
+
+- name: Ensure Flask app directory exists under /home/devops
+  file:
+    path: /home/devops/flask_app
+    state: directory
+    owner: devops
+    group: devops
+    mode: '0755'
+  become: yes
+
+- name: Copy Flask app files to devops home
+  copy:
+    src: flask_app/
+    dest: /home/devops/flask_app/
+    owner: devops
+    group: devops
+    mode: '0644'
+  become: yes
+
+- name: Create systemd service for Flask app (runs as devops)
+  copy:
+    dest: /etc/systemd/system/flask_app.service
+    mode: '0644'
+    content: |
+      [Unit]
+      Description=Flask Application
+      After=network.target
+
+      [Service]
+      Type=simple
+      User=devops
+      Group=devops
+      WorkingDirectory=/home/devops/flask_app
+      ExecStart=/usr/bin/python3 /home/devops/flask_app/app.py
+      Restart=on-failure
+
+      [Install]
+      WantedBy=multi-user.target
+  notify: restart flask app
+  become: yes
+
+- name: Enable and start Flask service
+  systemd:
+    name: flask_app
+    enabled: yes
+    state: started
+    daemon_reload: yes
+  become: yes

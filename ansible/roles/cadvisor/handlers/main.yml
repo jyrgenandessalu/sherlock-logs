@@ -1,0 +1,10 @@
+---
+# Handlers for cadvisor role
+
+- name: restart cadvisor
+  docker_container:
+    name: cadvisor
+    state: started
+    restart_policy: always
+  become: yes
+

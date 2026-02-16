@@ -1,0 +1,233 @@
+---
+- name: Ensure app directory exists
+  file:
+    path: /opt/flask_backend
+    state: directory
+    owner: devops
+    group: devops
+    mode: '0755'
+
+- name: Ensure Flask app log directory exists
+  file:
+    path: /var/log/flask_apps
+    state: directory
+    owner: root
+    group: root
+    mode: '1777'
+  become: yes
+
+- name: Copy Flask app files
+  copy:
+    src: app/
+    dest: /opt/flask_backend/app/
+    owner: devops
+    group: devops
+    mode: '0755'
+
+- name: Copy Dockerfile
+  copy:
+    src: Dockerfile
+    dest: /opt/flask_backend/Dockerfile
+
+- name: Ensure Docker is installed
+  apt:
+    name:
+      - docker.io
+      - python3-pip
+    state: present
+    update_cache: yes
+
+- name: Install Docker Python SDK
+  pip:
+    name: docker
+    state: present
+
+- name: Ensure Docker service is running
+  systemd:
+    name: docker
+    state: started
+    enabled: yes
+
+- name: Build backend Docker image
+  community.docker.docker_image:
+    name: flask-backend
+    tag: latest
+    build:
+      path: /opt/flask_backend
+    source: build
+    force_source: true
+
+- name: Stop and remove any running backend container
+  shell: |
+    docker stop flask_backend 2>/dev/null || true
+    docker rm -f flask_backend 2>/dev/null || true
+    # Also check for any other containers using port 5000 (escape braces for Ansible)
+    docker ps -a --format "{{ '{{' }}.Names{{ '}}' }} {{ '{{' }}.Ports{{ '}}' }}" | grep 5000 || true
+  ignore_errors: yes
+  changed_when: false
+
+- name: Stop any systemd services that might be running Flask on port 5000
+  shell: |
+    # Find and stop any systemd services that might be running Flask
+    systemctl list-units --type=service --state=running | grep -i flask | awk '{print $1}' | xargs -r systemctl stop 2>/dev/null || true
+    systemctl list-units --type=service --state=running | grep -i python | awk '{print $1}' | xargs -r systemctl stop 2>/dev/null || true
+    # Also check for any service files that might auto-start Flask
+    find /etc/systemd/system -name "*flask*" -o -name "*app*" 2>/dev/null | xargs -r systemctl stop 2>/dev/null || true
+  ignore_errors: yes
+  changed_when: false
+
+- name: Kill any process using port 5000
+  shell: |
+    # Find and kill any process using port 5000
+    if command -v fuser >/dev/null 2>&1; then
+      fuser -k 5000/tcp 2>/dev/null || true
+    fi
+    if command -v lsof >/dev/null 2>&1; then
+      # Kill processes multiple times to catch any that restart
+      for i in {1..5}; do
+        PIDS=$(lsof -ti:5000 2>/dev/null || true)
+        if [ -z "$PIDS" ]; then break; fi
+        kill -9 $PIDS 2>/dev/null || true
+        sleep 1
+      done
+    fi
+    # Also kill any Python processes that might be Flask apps
+    pkill -9 -f "python.*app.py" 2>/dev/null || true
+    pkill -9 -f "flask.*run" 2>/dev/null || true
+    pkill -9 -f "python.*5000" 2>/dev/null || true
+    # Wait a moment for processes to die
+    sleep 3
+  ignore_errors: yes
+  changed_when: false
+
+- name: Remove Docker iptables NAT rules for port 5000
+  shell: |
+    # Remove any existing NAT rules for port 5000
+    iptables -t nat -D DOCKER -p tcp --dport 5000 -j DNAT --to-destination 172.17.0.0/16:5000 2>/dev/null || true
+    iptables -t nat -D DOCKER -p tcp --dport 5000 -j DNAT --to-destination 172.17.0.2:5000 2>/dev/null || true
+    iptables -t nat -D DOCKER -p tcp --dport 5000 -j DNAT --to-destination 172.17.0.3:5000 2>/dev/null || true
+    # Remove all DOCKER rules for port 5000 (try multiple times to catch all)
+    for i in {1..10}; do
+      LINE=$(iptables -t nat -L DOCKER -n --line-numbers | grep -E '5000|:5000' | head -1 | awk '{print $1}')
+      if [ -z "$LINE" ]; then break; fi
+      iptables -t nat -D DOCKER $LINE 2>/dev/null || break
+    done
+    # Also check OUTPUT chain
+    for i in {1..10}; do
+      LINE=$(iptables -t nat -L OUTPUT -n --line-numbers | grep -E '5000|:5000' | head -1 | awk '{print $1}')
+      if [ -z "$LINE" ]; then break; fi
+      iptables -t nat -D OUTPUT $LINE 2>/dev/null || break
+    done
+  ignore_errors: yes
+  changed_when: false
+
+- name: Stop all containers before restarting Docker
+  shell: |
+    docker stop $(docker ps -aq) 2>/dev/null || true
+    docker rm $(docker ps -aq) 2>/dev/null || true
+  ignore_errors: yes
+  changed_when: false
+
+- name: Restart Docker service to clear stuck port bindings
+  systemd:
+    name: docker
+    state: restarted
+  ignore_errors: yes
+
+- name: Wait for Docker to be ready
+  command: docker info
+  register: docker_ready
+  until: docker_ready.rc == 0
+  retries: 15
+  delay: 2
+  ignore_errors: yes
+
+- name: Wait additional time for port cleanup
+  pause:
+    seconds: 5
+
+- name: Prune unused Docker networks (may help with port conflicts)
+  shell: docker network prune -f
+  ignore_errors: yes
+  changed_when: false
+
+- name: Check what's using port 5000 before starting container
+  shell: |
+    echo "=== Checking port 5000 ==="
+    ss -tlnp | grep :5000 || echo "No process found with ss"
+    netstat -tlnp 2>/dev/null | grep :5000 || echo "No process found with netstat"
+    lsof -i :5000 2>/dev/null || echo "No process found with lsof"
+    echo "=== Docker containers ==="
+    docker ps -a | grep flask_backend || echo "No flask_backend container"
+    echo "=== Docker networks ==="
+    docker network ls
+    echo "=== iptables NAT rules for 5000 ==="
+    iptables -t nat -L -n | grep 5000 || echo "No iptables NAT rules for 5000"
+  register: port_check
+  changed_when: false
+  failed_when: false
+
+- name: Display port check results
+  debug:
+    var: port_check.stdout_lines
+
+- name: Kill any remaining processes on port 5000 (final check)
+  shell: |
+    # Force kill anything still on port 5000 (try multiple times)
+    for i in {1..10}; do
+      if command -v lsof >/dev/null 2>&1; then
+        PIDS=$(lsof -ti:5000 2>/dev/null || true)
+        if [ -z "$PIDS" ]; then
+          echo "Port 5000 is free after $i attempts"
+          break
+        fi
+        echo "Attempt $i: Killing processes on port 5000: $PIDS"
+        kill -9 $PIDS 2>/dev/null || true
+        sleep 1
+      fi
+    done
+    # Also check parent processes and kill the whole process tree
+    if command -v pstree >/dev/null 2>&1; then
+      lsof -ti:5000 | while read PID; do
+        # Kill the entire process tree
+        pkill -9 -P $PID 2>/dev/null || true
+        kill -9 $PID 2>/dev/null || true
+      done
+    fi
+    # Final verification
+    if command -v ss >/dev/null 2>&1; then
+      if ss -tlnp | grep -q :5000; then
+        echo "WARNING: Port 5000 still in use after all attempts!"
+        ss -tlnp | grep :5000
+        exit 1
+      else
+        echo "SUCCESS: Port 5000 is free"
+      fi
+    fi
+  ignore_errors: yes
+  changed_when: false
+
+- name: Run backend container
+  docker_container:
+    name: flask_backend
+    image: flask-backend:latest
+    restart_policy: always
+    state: started
+    recreate: yes
+    force_kill: yes
+    ports:
+      - "5000:5000"
+    volumes:
+      - /var/log/flask_apps:/var/log/flask_apps:rw
+    env:
+      ROLE: "backend"
+      HOST_VM: "{{ ansible_hostname }}"
+
+- name: Verify backend container is running
+  shell: docker ps --filter "name=flask_backend" --format "{{'{{.Names}}'}}"
+  register: backend_status
+  changed_when: false
+
+- name: Display backend container status
+  debug:
+    msg: "Backend container is running on {{ ansible_hostname }}: {{ backend_status.stdout }}"

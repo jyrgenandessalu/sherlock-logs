@@ -1,0 +1,87 @@
+---
+- name: Ensure app directory exists
+  file:
+    path: /opt/flask_frontend
+    state: directory
+    owner: devops
+    group: devops
+    mode: '0755'
+
+- name: Ensure Flask app log directory exists
+  file:
+    path: /var/log/flask_apps
+    state: directory
+    owner: root
+    group: root
+    mode: '1777'
+  become: yes
+
+- name: Copy Flask app files
+  copy:
+    src: app/
+    dest: /opt/flask_frontend/app/
+    owner: devops
+    group: devops
+    mode: '0755'
+
+- name: Copy Dockerfile
+  copy:
+    src: Dockerfile
+    dest: /opt/flask_frontend/Dockerfile
+
+- name: Ensure Docker is installed
+  apt:
+    name:
+      - docker.io
+      - python3-pip
+    state: present
+    update_cache: yes
+
+- name: Install Docker Python SDK
+  pip:
+    name: docker
+    state: present
+
+- name: Ensure Docker service is running
+  systemd:
+    name: docker
+    state: started
+    enabled: yes
+
+- name: Build frontend Docker image
+  community.docker.docker_image:
+    name: flask-frontend
+    tag: latest
+    build:
+      path: /opt/flask_frontend
+    source: build
+    force_source: true
+
+- name: Stop any running frontend container
+  docker_container:
+    name: flask_frontend
+    state: absent
+  ignore_errors: yes
+
+- name: Run frontend container
+  docker_container:
+    name: flask_frontend
+    image: flask-frontend:latest
+    restart_policy: always
+    state: started
+    ports:
+      - "5000:5000"
+    volumes:
+      - /var/log/flask_apps:/var/log/flask_apps:rw
+    env:
+      ROLE: "frontend"
+      HOST_VM: "{{ ansible_hostname }}"
+
+- name: Verify frontend container is running
+  shell: docker ps --filter "name=flask_frontend" --format "{{'{{.Names}}'}}"
+  register: frontend_status
+  changed_when: false
+
+- name: Display frontend container status
+  debug:
+    msg: "Frontend container is running on {{ ansible_hostname }}: {{ frontend_status.stdout }}"

@@ -1,0 +1,8 @@
+---
+# handlers/main.yml - Restart Flask app service
+
+- name: restart flask app
+  systemd:
+    name: flask_app
+    state: restarted
+    daemon_reload: yes

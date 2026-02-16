@@ -1,0 +1,1216 @@
+---
+# Monitoring role for Sherlock-Logs
+# This role will set up Prometheus, Grafana, and ELK stack
+
+- name: Ensure monitoring VM is ready
+  debug:
+    msg: "Monitoring VM ({{ ansible_hostname }}) is ready for monitoring/logging setup"
+
+# ============================================================================
+# Phase 2.1: Prometheus Installation
+# ============================================================================
+
+- name: Create Prometheus user
+  user:
+    name: prometheus
+    system: yes
+    shell: /usr/sbin/nologin
+    home: /var/lib/prometheus
+    create_home: yes
+    comment: Prometheus monitoring system
+  become: yes
+
+- name: Create Prometheus directories
+  file:
+    path: "{{ item }}"
+    state: directory
+    owner: prometheus
+    group: prometheus
+    mode: '0755'
+  become: yes
+  loop:
+    - /etc/prometheus
+    - /var/lib/prometheus
+    - /var/lib/prometheus/data
+
+- name: Get latest Prometheus version
+  uri:
+    url: https://api.github.com/repos/prometheus/prometheus/releases/latest
+    return_content: yes
+  register: prometheus_release
+  changed_when: false
+
+- name: Set Prometheus version variable
+  set_fact:
+    prometheus_version: "{{ prometheus_release.json.tag_name | regex_replace('^v', '') }}"
+    prometheus_download_url: "https://github.com/prometheus/prometheus/releases/download/{{ prometheus_release.json.tag_name }}/prometheus-{{ prometheus_release.json.tag_name[1:] }}.linux-amd64.tar.gz"
+
+- name: Download Prometheus
+  get_url:
+    url: "{{ prometheus_download_url }}"
+    dest: /tmp/prometheus.tar.gz
+    mode: '0644'
+  become: yes
+  register: prometheus_download
+
+- name: Extract Prometheus archive
+  unarchive:
+    src: /tmp/prometheus.tar.gz
+    dest: /tmp
+    remote_src: yes
+    creates: /tmp/prometheus-{{ prometheus_version }}.linux-amd64
+  become: yes
+  when: prometheus_download.changed
+
+- name: Copy Prometheus binary
+  copy:
+    src: "/tmp/prometheus-{{ prometheus_version }}.linux-amd64/prometheus"
+    dest: /usr/local/bin/prometheus
+    owner: root
+    group: root
+    mode: '0755'
+    remote_src: yes
+  become: yes
+  notify: restart prometheus
+
+- name: Copy Promtool binary
+  copy:
+    src: "/tmp/prometheus-{{ prometheus_version }}.linux-amd64/promtool"
+    dest: /usr/local/bin/promtool
+    owner: root
+    group: root
+    mode: '0755'
+    remote_src: yes
+  become: yes
+
+- name: Check if console directories exist in Prometheus archive
+  stat:
+    path: "/tmp/prometheus-{{ prometheus_version }}.linux-amd64/consoles"
+  register: consoles_dir
+  changed_when: false
+
+- name: Copy Prometheus console libraries (if they exist)
+  copy:
+    src: "/tmp/prometheus-{{ prometheus_version }}.linux-amd64/consoles"
+    dest: /etc/prometheus/consoles
+    owner: prometheus
+    group: prometheus
+    mode: '0755'
+    remote_src: yes
+  become: yes
+  when: consoles_dir.stat.exists
+  notify: restart prometheus
+
+- name: Check if console_libraries directory exists in Prometheus archive
+  stat:
+    path: "/tmp/prometheus-{{ prometheus_version }}.linux-amd64/console_libraries"
+  register: console_libraries_dir
+  changed_when: false
+
+- name: Copy Prometheus console templates (if they exist)
+  copy:
+    src: "/tmp/prometheus-{{ prometheus_version }}.linux-amd64/console_libraries"
+    dest: /etc/prometheus/console_libraries
+    owner: prometheus
+    group: prometheus
+    mode: '0755'
+    remote_src: yes
+  become: yes
+  when: console_libraries_dir.stat.exists
+  notify: restart prometheus
+
+- name: Create basic Prometheus configuration
+  copy:
+    dest: /etc/prometheus/prometheus.yml
+    owner: prometheus
+    group: prometheus
+    mode: '0644'
+    content: |
+      # Prometheus configuration file
+      # This is a basic configuration - will be expanded in subsequent steps
+      
+      global:
+        scrape_interval: 15s      # How often to scrape targets
+        evaluation_interval: 15s  # How often to evaluate rules
+        external_labels:
+          monitor: 'sherlock-logs'
+      
+      # Alertmanager configuration (to be added later)
+      # alerting:
+      #   alertmanagers:
+      #     - static_configs:
+      #         - targets:
+      
+      # Load rules once and periodically evaluate them
+      rule_files:
+        # - "first_rules.yml"
+        # - "second_rules.yml"
+      
+      # Scrape configurations
+      scrape_configs:
+        # Prometheus itself
+        - job_name: 'prometheus'
+          static_configs:
+            - targets: ['localhost:9090']
+        
+        # Node Exporter - collects system metrics from all VMs
+        - job_name: 'node_exporter'
+          static_configs:
+            - targets:
+                - '192.168.56.20:9100'  # lb-server-auto
+                - '192.168.56.21:9100'  # web1-server-auto
+                - '192.168.56.22:9100'  # web2-server-auto
+                - '192.168.56.23:9100'  # app-server-auto
+                - '192.168.56.24:9100'  # backup-server-auto
+                - '192.168.56.25:9100'  # monitoring-server-auto
+        
+        # cAdvisor - collects Docker container metrics from VMs with Docker
+        - job_name: 'cadvisor'
+          static_configs:
+            - targets:
+                - '192.168.56.21:8080'  # web1-server-auto
+                - '192.168.56.22:8080'  # web2-server-auto
+                - '192.168.56.23:8080'  # app-server-auto
+        
+        # Flask Application Metrics - custom application metrics
+        - job_name: 'flask_apps'
+          static_configs:
+            - targets:
+                - '192.168.56.21:5000'  # web1-server-auto (frontend container)
+                - '192.168.56.22:5000'  # web2-server-auto (frontend container)
+                - '192.168.56.23:5000'  # app-server-auto (backend container + app_deploy)
+          metrics_path: '/metrics'
+        
+        # Elasticsearch Health Exporter
+        - job_name: 'elasticsearch_exporter'
+          static_configs:
+            - targets:
+                - '192.168.56.25:9114'  # monitoring-server-auto
+          metrics_path: '/metrics'
+  become: yes
+  notify: restart prometheus
+
+- name: Create Prometheus systemd service
+  copy:
+    dest: /etc/systemd/system/prometheus.service
+    mode: '0644'
+    content: |
+      [Unit]
+      Description=Prometheus Monitoring System
+      Documentation=https://prometheus.io/docs/introduction/overview/
+      After=network-online.target
+      Wants=network-online.target
+      
+      [Service]
+      Type=simple
+      User=prometheus
+      Group=prometheus
+      Restart=always
+      RestartSec=5
+      ExecStart=/usr/local/bin/prometheus \
+        --config.file=/etc/prometheus/prometheus.yml \
+        --storage.tsdb.path=/var/lib/prometheus/data \
+        --web.listen-address=0.0.0.0:9090 \
+        --web.enable-lifecycle
+      
+      [Install]
+      WantedBy=multi-user.target
+  become: yes
+  notify: restart prometheus
+
+- name: Reload systemd daemon
+  systemd:
+    daemon_reload: yes
+  become: yes
+
+- name: Enable and start Prometheus service
+  systemd:
+    name: prometheus
+    enabled: yes
+    state: started
+  become: yes
+
+- name: Allow Prometheus port in UFW
+  ufw:
+    rule: allow
+    port: '9090'
+    proto: tcp
+  become: yes
+
+- name: Wait for Prometheus to be ready
+  uri:
+    url: http://localhost:9090/-/ready
+    method: GET
+    status_code: 200
+  register: prometheus_ready
+  retries: 10
+  delay: 5
+  until: prometheus_ready.status == 200
+  ignore_errors: yes
+
+- name: Verify Prometheus is running
+  uri:
+    url: http://localhost:9090/api/v1/status/config
+    method: GET
+    status_code: 200
+  register: prometheus_status
+  changed_when: false
+
+- name: Display Prometheus status
+  debug:
+    msg: "Prometheus is running and accessible at http://{{ ansible_default_ipv4.address }}:9090"
+
+# ============================================================================
+# Phase 3.1: Grafana Installation and Configuration
+# ============================================================================
+
+- name: Remove existing Grafana repository file and key FIRST (to avoid apt errors)
+  file:
+    path: "{{ item }}"
+    state: absent
+  become: yes
+  loop:
+    - /etc/apt/sources.list.d/grafana.list
+    - /usr/share/keyrings/grafana.gpg
+
+- name: Install required packages for Grafana
+  apt:
+    name:
+      - apt-transport-https
+      - software-properties-common
+      - wget
+      - curl
+      - gnupg
+    state: present
+    update_cache: yes
+  become: yes
+
+- name: Ensure keyring directory exists
+  file:
+    path: /usr/share/keyrings
+    state: directory
+    mode: '0755'
+  become: yes
+
+- name: Get latest Grafana version from GitHub
+  uri:
+    url: https://api.github.com/repos/grafana/grafana/releases/latest
+    return_content: yes
+    status_code: [200, 301, 302]
+  register: grafana_release
+  changed_when: false
+  ignore_errors: yes
+
+- name: Extract Grafana version from API response
+  set_fact:
+    grafana_version: "{{ (grafana_release.json.tag_name | default('11.3.0')) | regex_replace('^v', '') }}"
+  when: grafana_release.status is defined and grafana_release.status == 200
+
+- name: Set default Grafana version if API failed
+  set_fact:
+    grafana_version: "11.3.0"
+  when: grafana_release.status is not defined or grafana_release.status != 200
+
+- name: Set Grafana .deb download URL
+  set_fact:
+    grafana_deb_url: "https://dl.grafana.com/oss/release/grafana_{{ grafana_version }}_amd64.deb"
+
+- name: Download Grafana .deb package
+  get_url:
+    url: "{{ grafana_deb_url }}"
+    dest: /tmp/grafana.deb
+    mode: '0644'
+  become: yes
+  register: grafana_download
+
+- name: Install Grafana from .deb package
+  apt:
+    deb: /tmp/grafana.deb
+    state: present
+  become: yes
+  notify: restart grafana
+
+- name: Create Grafana configuration directory
+  file:
+    path: /etc/grafana/provisioning/datasources
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+  become: yes
+
+- name: Create Prometheus data source configuration for Grafana
+  copy:
+    dest: /etc/grafana/provisioning/datasources/prometheus.yml
+    owner: root
+    group: root
+    mode: '0644'
+    content: |
+      apiVersion: 1
+      
+      datasources:
+        - name: Prometheus
+          type: prometheus
+          access: proxy
+          url: http://localhost:9090
+          isDefault: true
+          editable: true
+          jsonData:
+            timeInterval: "15s"
+  become: yes
+  notify: restart grafana
+
+- name: Configure Grafana admin user
+  replace:
+    path: /etc/grafana/grafana.ini
+    regexp: '^;?admin_user = .*'
+    replace: 'admin_user = admin'
+    backup: yes
+  become: yes
+  notify: restart grafana
+
+- name: Configure Grafana admin password
+  replace:
+    path: /etc/grafana/grafana.ini
+    regexp: '^;?admin_password = .*'
+    replace: 'admin_password = admin'
+    backup: yes
+  become: yes
+  notify: restart grafana
+
+- name: Configure Grafana to listen on all interfaces
+  lineinfile:
+    path: /etc/grafana/grafana.ini
+    regexp: "^;?http_addr ="
+    line: "http_addr = 0.0.0.0"
+    backup: yes
+  become: yes
+  notify: restart grafana
+
+- name: Configure Grafana port
+  lineinfile:
+    path: /etc/grafana/grafana.ini
+    regexp: "^;?http_port ="
+    line: "http_port = 3000"
+    backup: yes
+  become: yes
+  notify: restart grafana
+
+- name: Enable and start Grafana service
+  systemd:
+    name: grafana-server
+    enabled: yes
+    state: started
+    daemon_reload: yes
+  become: yes
+
+- name: Allow Grafana port in UFW
+  ufw:
+    rule: allow
+    port: '3000'
+    proto: tcp
+  become: yes
+
+- name: Wait for Grafana to be ready
+  uri:
+    url: http://localhost:3000/api/health
+    method: GET
+    status_code: 200
+  register: grafana_ready
+  retries: 15
+  delay: 3
+  until: grafana_ready.status == 200
+  ignore_errors: yes
+
+- name: Verify Grafana is running
+  uri:
+    url: http://localhost:3000/api/datasources
+    method: GET
+    status_code: 200
+    user: admin
+    password: admin
+    force_basic_auth: yes
+  register: grafana_status
+  changed_when: false
+  ignore_errors: yes
+
+- name: Display Grafana status
+  debug:
+    msg: "Grafana is running and accessible at http://{{ ansible_default_ipv4.address }}:3000 (admin/admin)"
+
+# ============================================================================
+# Phase 3.2-3.4: Grafana Dashboards Provisioning
+# ============================================================================
+
+- name: Create Grafana dashboards directory
+  file:
+    path: /var/lib/grafana/dashboards
+    state: directory
+    owner: grafana
+    group: grafana
+    mode: '0755'
+  become: yes
+
+- name: Copy VM Performance Dashboard
+  copy:
+    src: dashboards/vm-performance.json
+    dest: /var/lib/grafana/dashboards/vm-performance.json
+    owner: grafana
+    group: grafana
+    mode: '0644'
+  become: yes
+  notify: restart grafana
+
+- name: Copy Docker Container Dashboard
+  copy:
+    src: dashboards/docker-containers.json
+    dest: /var/lib/grafana/dashboards/docker-containers.json
+    owner: grafana
+    group: grafana
+    mode: '0644'
+  become: yes
+  notify: restart grafana
+
+- name: Copy Application Performance Dashboard
+  copy:
+    src: dashboards/application-performance.json
+    dest: /var/lib/grafana/dashboards/application-performance.json
+    owner: grafana
+    group: grafana
+    mode: '0644'
+  become: yes
+  notify: restart grafana
+
+- name: Create Grafana dashboard provisioning directory
+  file:
+    path: /etc/grafana/provisioning/dashboards
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+  become: yes
+
+- name: Create Grafana dashboard provisioning configuration
+  copy:
+    dest: /etc/grafana/provisioning/dashboards/dashboards.yml
+    owner: root
+    group: root
+    mode: '0644'
+    content: |
+      apiVersion: 1
+      
+      providers:
+        - name: 'Default'
+          orgId: 1
+          folder: ''
+          type: file
+          disableDeletion: false
+          updateIntervalSeconds: 10
+          allowUiUpdates: true
+          options:
+            path: /var/lib/grafana/dashboards
+  become: yes
+  notify: restart grafana
+
+- name: Display dashboard provisioning status
+  debug:
+    msg: "Grafana dashboards provisioned. Access them at http://{{ ansible_default_ipv4.address }}:3000"
+
+# ============================================================================
+# Phase 4.1: Elasticsearch Installation
+# ============================================================================
+
+- name: Install Java (required for Elasticsearch)
+  apt:
+    name: openjdk-17-jdk
+    state: present
+    update_cache: yes
+  become: yes
+
+- name: Set JAVA_HOME environment variable
+  lineinfile:
+    path: /etc/environment
+    regexp: '^JAVA_HOME='
+    line: 'JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64'
+    backup: yes
+  become: yes
+
+- name: Install required packages for Elasticsearch
+  apt:
+    name:
+      - apt-transport-https
+      - wget
+      - curl
+      - gnupg
+    state: present
+    update_cache: yes
+  become: yes
+
+- name: Ensure keyring directory exists
+  file:
+    path: /usr/share/keyrings
+    state: directory
+    mode: '0755'
+  become: yes
+
+- name: Download Elasticsearch GPG key
+  get_url:
+    url: https://artifacts.elastic.co/GPG-KEY-elasticsearch
+    dest: /tmp/elasticsearch.gpg
+    mode: '0644'
+  become: yes
+
+- name: Add Elasticsearch GPG key to keyring
+  shell: gpg --dearmor < /tmp/elasticsearch.gpg | tee /usr/share/keyrings/elasticsearch.gpg
+  become: yes
+  args:
+    creates: /usr/share/keyrings/elasticsearch.gpg
+
+- name: Add Elasticsearch APT repository
+  apt_repository:
+    repo: "deb [signed-by=/usr/share/keyrings/elasticsearch.gpg] https://artifacts.elastic.co/packages/8.x/apt stable main"
+    state: present
+    filename: elasticsearch
+  become: yes
+
+- name: Update apt cache after adding Elasticsearch repository
+  apt:
+    update_cache: yes
+  become: yes
+
+- name: Install Elasticsearch
+  apt:
+    name: elasticsearch
+    state: present
+  become: yes
+  notify: restart elasticsearch
+
+- name: Get system memory in MB
+  shell: free -m | awk '/^Mem:/{print $2}'
+  register: system_memory_mb
+  changed_when: false
+
+- name: Calculate Elasticsearch heap size (50% of RAM, max 4GB) - ensure integer
+  set_fact:
+    es_heap_size_mb: "{{ [((system_memory_mb.stdout | int) / 2) | int, 4096] | min }}"
+
+- name: Set Elasticsearch heap size with 'm' suffix
+  set_fact:
+    es_heap_size: "{{ es_heap_size_mb }}m"
+
+- name: Configure Elasticsearch heap size
+  lineinfile:
+    path: /etc/elasticsearch/jvm.options
+    regexp: '^-Xms'
+    line: "-Xms{{ es_heap_size }}"
+    backup: yes
+  become: yes
+  notify: restart elasticsearch
+
+- name: Configure Elasticsearch max heap size
+  lineinfile:
+    path: /etc/elasticsearch/jvm.options
+    regexp: '^-Xmx'
+    line: "-Xmx{{ es_heap_size }}"
+    backup: yes
+  become: yes
+  notify: restart elasticsearch
+
+- name: Configure Elasticsearch network settings
+  lineinfile:
+    path: /etc/elasticsearch/elasticsearch.yml
+    regexp: "^{{ item.regexp }}"
+    line: "{{ item.line }}"
+    backup: yes
+  become: yes
+  loop:
+    - { regexp: '^#?network.host:', line: 'network.host: 0.0.0.0' }
+    - { regexp: '^#?http.port:', line: 'http.port: 9200' }
+    - { regexp: '^#?discovery.type:', line: 'discovery.type: single-node' }
+    - { regexp: '^#?cluster.name:', line: 'cluster.name: sherlock-logs' }
+    - { regexp: '^#?xpack.security.enabled:', line: 'xpack.security.enabled: false' }
+    - { regexp: '^#?xpack.security.enrollment.enabled:', line: 'xpack.security.enrollment.enabled: false' }
+  notify: restart elasticsearch
+
+- name: Remove cluster.initial_master_nodes (not allowed with single-node mode)
+  lineinfile:
+    path: /etc/elasticsearch/elasticsearch.yml
+    regexp: '^#?cluster.initial_master_nodes:'
+    state: absent
+  become: yes
+  notify: restart elasticsearch
+
+- name: Create Elasticsearch data directory
+  file:
+    path: /var/lib/elasticsearch
+    state: directory
+    owner: elasticsearch
+    group: elasticsearch
+    mode: '0755'
+  become: yes
+
+- name: Create Elasticsearch log directory
+  file:
+    path: /var/log/elasticsearch
+    state: directory
+    owner: elasticsearch
+    group: elasticsearch
+    mode: '0755'
+  become: yes
+
+- name: Reload systemd daemon
+  systemd:
+    daemon_reload: yes
+  become: yes
+
+- name: Enable and start Elasticsearch service
+  systemd:
+    name: elasticsearch
+    enabled: yes
+    state: started
+  become: yes
+
+- name: Allow Elasticsearch port in UFW
+  ufw:
+    rule: allow
+    port: '9200'
+    proto: tcp
+  become: yes
+
+- name: Wait for Elasticsearch to be ready
+  uri:
+    url: http://localhost:9200/_cluster/health
+    method: GET
+    status_code: [200, 503]
+  register: es_health
+  retries: 30
+  delay: 5
+  until: es_health.status == 200
+  ignore_errors: yes
+
+- name: Verify Elasticsearch is running
+  uri:
+    url: http://localhost:9200
+    method: GET
+    status_code: 200
+  register: es_status
+  changed_when: false
+
+- name: Display Elasticsearch status
+  debug:
+    msg: "Elasticsearch is running and accessible at http://{{ ansible_default_ipv4.address }}:9200"
+
+# Elasticsearch Health Exporter (minimal - for Prometheus monitoring)
+- name: Copy Elasticsearch health exporter
+  copy:
+    src: elasticsearch_health_exporter.py
+    dest: /usr/local/bin/elasticsearch_health_exporter.py
+    owner: root
+    group: root
+    mode: '0755'
+  become: yes
+
+- name: Create systemd service for Elasticsearch health exporter
+  copy:
+    dest: /etc/systemd/system/elasticsearch_health_exporter.service
+    content: |
+      [Unit]
+      Description=Elasticsearch Health Exporter
+      After=elasticsearch.service
+      [Service]
+      Type=simple
+      User=nobody
+      ExecStart=/usr/bin/python3 /usr/local/bin/elasticsearch_health_exporter.py
+      Restart=always
+      [Install]
+      WantedBy=multi-user.target
+  become: yes
+  notify: restart elasticsearch_health_exporter
+
+- name: Enable and start Elasticsearch health exporter
+  systemd:
+    name: elasticsearch_health_exporter
+    enabled: yes
+    state: started
+    daemon_reload: yes
+  become: yes
+
+# ============================================================================
+# Phase 4.2: Logstash Installation
+# ============================================================================
+
+- name: Add Logstash APT repository (reuse Elasticsearch GPG key)
+  apt_repository:
+    repo: "deb [signed-by=/usr/share/keyrings/elasticsearch.gpg] https://artifacts.elastic.co/packages/8.x/apt stable main"
+    state: present
+    filename: logstash
+  become: yes
+
+- name: Update apt cache after adding Logstash repository
+  apt:
+    update_cache: yes
+  become: yes
+
+- name: Install Logstash
+  apt:
+    name: logstash
+    state: present
+  become: yes
+  notify: restart logstash
+
+- name: Create Logstash configuration directory
+  file:
+    path: /etc/logstash/conf.d
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+  become: yes
+
+- name: Create Logstash configuration file
+  copy:
+    dest: /etc/logstash/conf.d/logstash.conf
+    owner: root
+    group: root
+    mode: '0644'
+    content: |
+      input {
+        beats {
+          port => 5044
+        }
+      }
+
+      filter {
+        # Parse system logs (syslog format)
+        if [fields][log_type] == "syslog" {
+          grok {
+            match => { "message" => "%{SYSLOGTIMESTAMP:timestamp} %{IPORHOST:hostname} %{PROG:program}(?:\[%{POSINT:pid}\])?: %{GREEDYDATA:message}" }
+          }
+          date {
+            match => [ "timestamp", "MMM  d HH:mm:ss", "MMM dd HH:mm:ss" ]
+          }
+        }
+
+        # Parse application logs (JSON format from Flask)
+        if [fields][log_type] == "application" {
+          json {
+            source => "message"
+          }
+        }
+
+        # Parse Docker container logs
+        if [fields][log_type] == "docker" {
+          if [message] =~ /^\{/ {
+            json {
+              source => "message"
+            }
+          }
+        }
+
+        # Add hostname if not present
+        if ![host] {
+          mutate {
+            add_field => { "host" => "%{[agent][hostname]}" }
+          }
+        }
+      }
+
+      output {
+        # Send alerts for critical errors (ERROR, CRITICAL, FATAL levels)
+        if [level] == "error" or [level] == "critical" or [level] == "fatal" or [message] =~ /(?i)(ERROR|CRITICAL|FATAL|FAILED|EXCEPTION)/ {
+          # Option 1: HTTP webhook (can be configured to send to alerting service)
+          # Uncomment and configure if you have an alerting webhook endpoint
+          # http {
+          #   url => "http://alerting-service:8080/alert"
+          #   http_method => "post"
+          #   content_type => "application/json"
+          #   format => "json"
+          # }
+          
+          # Option 2: File output for alerts (can be monitored by external tools)
+          file {
+            path => "/var/log/logstash/alerts.log"
+            codec => "json_lines"
+          }
+          
+          # Option 3: stdout for systemd logs (visible in journalctl)
+          stdout {
+            codec => rubydebug
+          }
+        }
+        
+        # Always send to Elasticsearch
+        elasticsearch {
+          hosts => ["http://localhost:9200"]
+          index => "logs-%{+YYYY.MM.dd}"
+        }
+      }
+  become: yes
+  notify: restart logstash
+
+- name: Create Logstash alerts log directory
+  file:
+    path: /var/log/logstash
+    state: directory
+    owner: logstash
+    group: logstash
+    mode: '0755'
+  become: yes
+
+- name: Create Logstash pipeline configuration
+  copy:
+    dest: /etc/logstash/pipelines.yml
+    owner: root
+    group: root
+    mode: '0644'
+    content: |
+      - pipeline.id: main
+        path.config: "/etc/logstash/conf.d/logstash.conf"
+  become: yes
+  notify: restart logstash
+
+- name: Configure Logstash JVM heap size (use same as Elasticsearch)
+  lineinfile:
+    path: /etc/logstash/jvm.options
+    regexp: '^-Xms'
+    line: "-Xms{{ es_heap_size_mb }}m"
+    backup: yes
+  become: yes
+  notify: restart logstash
+
+- name: Configure Logstash max JVM heap size
+  lineinfile:
+    path: /etc/logstash/jvm.options
+    regexp: '^-Xmx'
+    line: "-Xmx{{ es_heap_size_mb }}m"
+    backup: yes
+  become: yes
+  notify: restart logstash
+
+- name: Reload systemd daemon
+  systemd:
+    daemon_reload: yes
+  become: yes
+
+- name: Enable and start Logstash service
+  systemd:
+    name: logstash
+    enabled: yes
+    state: started
+  become: yes
+
+- name: Allow Logstash Beats port in UFW
+  ufw:
+    rule: allow
+    port: '5044'
+    proto: tcp
+  become: yes
+
+- name: Wait for Logstash to be ready
+  uri:
+    url: http://localhost:9600/_node/stats
+    method: GET
+    status_code: 200
+  register: logstash_ready
+  retries: 20
+  delay: 5
+  until: logstash_ready.status == 200
+  ignore_errors: yes
+
+- name: Verify Logstash is running
+  uri:
+    url: http://localhost:9600/_node/stats
+    method: GET
+    status_code: 200
+  register: logstash_status
+  changed_when: false
+  ignore_errors: yes
+
+- name: Display Logstash status
+  debug:
+    msg: "Logstash is running and accessible at http://{{ ansible_default_ipv4.address }}:9600 (API) and listening on port 5044 (Beats input)"
+  when: logstash_status.status == 200
+
+- name: Display Logstash warning if not ready
+  debug:
+    msg: "Warning: Logstash API not responding yet, but service may still be starting. Check status manually: sudo systemctl status logstash"
+  when: logstash_status.status != 200
+
+# ============================================================================
+# Phase 4.5: Kibana Installation and Configuration
+# ============================================================================
+
+- name: Add Kibana APT repository (reuse Elasticsearch GPG key)
+  apt_repository:
+    repo: "deb [signed-by=/usr/share/keyrings/elasticsearch.gpg] https://artifacts.elastic.co/packages/8.x/apt stable main"
+    state: present
+    filename: kibana
+  become: yes
+
+- name: Update apt cache after adding Kibana repository
+  apt:
+    update_cache: yes
+  become: yes
+
+- name: Install Kibana
+  apt:
+    name: kibana
+    state: present
+  become: yes
+  notify: restart kibana
+
+- name: Configure Kibana to connect to Elasticsearch
+  lineinfile:
+    path: /etc/kibana/kibana.yml
+    regexp: "^{{ item.regexp }}"
+    line: "{{ item.line }}"
+    backup: yes
+  become: yes
+  loop:
+    - { regexp: '^#?server.host:', line: 'server.host: "0.0.0.0"' }
+    - { regexp: '^#?server.port:', line: 'server.port: 5601' }
+    - { regexp: '^#?elasticsearch.hosts:', line: 'elasticsearch.hosts: ["http://localhost:9200"]' }
+    - { regexp: '^#?elasticsearch.username:', line: '#elasticsearch.username: "elastic"' }
+    - { regexp: '^#?elasticsearch.password:', line: '#elasticsearch.password: "changeme"' }
+    - { regexp: '^#?xpack.encryptedSavedObjects.encryptionKey:', line: 'xpack.encryptedSavedObjects.encryptionKey: "sherlock-logs-encryption-key-32-chars!!"' }
+    - { regexp: '^#?xpack.security.encryptionKey:', line: 'xpack.security.encryptionKey: "sherlock-logs-security-key-32-chars!!"' }
+  notify: restart kibana
+
+- name: Remove xpack.security.enabled from kibana.yml (deprecated in Kibana 8.0+, removed in 8.19+)
+  lineinfile:
+    path: /etc/kibana/kibana.yml
+    regexp: '^#?xpack\.security\.enabled:'
+    state: absent
+  become: yes
+  notify: restart kibana
+
+- name: Verify xpack.security.enabled was removed (should not exist in Kibana 8.19+)
+  command: grep "^xpack.security.enabled:" /etc/kibana/kibana.yml
+  register: kibana_xpack_check
+  changed_when: false
+  failed_when: false
+  become: yes
+
+- name: Ensure xpack.security.enabled does not exist (required for Kibana 8.19+)
+  assert:
+    that:
+      - kibana_xpack_check.rc != 0
+    fail_msg: "xpack.security.enabled still exists in config but should be removed for Kibana 8.19+"
+    success_msg: "xpack.security.enabled correctly removed from config"
+
+- name: Reload systemd daemon
+  systemd:
+    daemon_reload: yes
+  become: yes
+
+- name: Ensure Elasticsearch is ready before starting Kibana
+  uri:
+    url: http://localhost:9200/_cluster/health
+    method: GET
+    status_code: 200
+  register: es_check
+  retries: 10
+  delay: 2
+  until: es_check.status == 200
+  ignore_errors: yes
+
+- name: Enable and start Kibana service
+  systemd:
+    name: kibana
+    enabled: yes
+    state: started
+  become: yes
+
+- name: Allow Kibana port in UFW
+  ufw:
+    rule: allow
+    port: '5601'
+    proto: tcp
+  become: yes
+
+- name: Wait a few seconds for Kibana to initialize
+  pause:
+    seconds: 5
+
+- name: Wait for Kibana to be ready (Kibana can take 5-10 minutes to start on first boot)
+  uri:
+    url: http://localhost:5601/api/status
+    method: GET
+    status_code: [200, 503]
+  register: kibana_health
+  retries: 20
+  delay: 15
+  until: kibana_health.status == 200
+  ignore_errors: yes
+
+- name: Complete Kibana interactive setup if needed (skip setup wizard)
+  uri:
+    url: http://localhost:5601/internal/interactive_setup/complete
+    method: POST
+    headers:
+      kbn-xsrf: "true"
+      Content-Type: "application/json"
+    body_format: json
+    body:
+      host: "http://localhost:9200"
+    status_code: [200, 204, 400, 404]
+  register: kibana_setup_complete
+  retries: 5
+  delay: 10
+  until: kibana_setup_complete.status in [200, 204, 400, 404]
+  ignore_errors: yes
+  when: kibana_health.status != 200
+
+- name: Check Kibana service status if wait failed
+  systemd:
+    name: kibana
+  register: kibana_service_status
+  changed_when: false
+  when: kibana_health.status != 200
+  ignore_errors: yes
+
+- name: Display Kibana service status if not ready
+  debug:
+    msg: "Kibana service status: {{ kibana_service_status.status.ActiveState }} - {{ kibana_service_status.status.SubState }}"
+  when: kibana_health.status != 200 and kibana_service_status is defined
+
+- name: Check Kibana logs if not ready
+  command: journalctl -u kibana --no-pager -n 20
+  register: kibana_logs
+  changed_when: false
+  when: kibana_health.status != 200
+  ignore_errors: yes
+
+- name: Display Kibana logs if not ready
+  debug:
+    msg: "{{ kibana_logs.stdout_lines }}"
+  when: kibana_health.status != 200 and kibana_logs is defined and kibana_logs.stdout_lines is defined
+
+- name: Verify Kibana is running
+  uri:
+    url: http://localhost:5601/api/status
+    method: GET
+    status_code: 200
+  register: kibana_status
+  changed_when: false
+  ignore_errors: yes
+
+- name: Display Kibana status
+  debug:
+    msg: "Kibana is running and accessible at http://{{ ansible_default_ipv4.address }}:5601"
+
+# ============================================================================
+# Phase 4.6: Kibana Dashboards Creation
+# ============================================================================
+
+- name: Wait for Kibana API to be fully ready (try setup completion first)
+  uri:
+    url: http://localhost:5601/internal/interactive_setup/complete
+    method: POST
+    headers:
+      kbn-xsrf: "true"
+      Content-Type: "application/json"
+    body_format: json
+    body:
+      host: "http://localhost:9200"
+    status_code: [200, 204, 400, 404]
+  register: kibana_setup_attempt
+  retries: 3
+  delay: 5
+  until: kibana_setup_attempt.status in [200, 204, 400, 404]
+  ignore_errors: yes
+
+- name: Wait for Kibana API to be fully ready
+  uri:
+    url: http://localhost:5601/api/status
+    method: GET
+    status_code: 200
+  register: kibana_api_ready
+  retries: 30
+  delay: 10
+  until: kibana_api_ready.status == 200
+  ignore_errors: yes
+
+- name: Install Python and pip (required for Kibana dashboard script)
+  apt:
+    name:
+      - python3
+      - python3-pip
+    state: present
+    update_cache: yes
+  become: yes
+
+- name: Install Python requests library (for Kibana dashboard script)
+  pip:
+    name: requests
+    state: present
+    executable: pip3
+  become: yes
+
+- name: Copy Kibana dashboard setup script
+  copy:
+    src: create_kibana_dashboards.py
+    dest: /usr/local/bin/create_kibana_dashboards.py
+    owner: root
+    group: root
+    mode: '0755'
+  become: yes
+
+- name: Fix line endings in Kibana dashboard setup script (convert Windows to Unix)
+  shell: sed -i 's/\r$//' /usr/local/bin/create_kibana_dashboards.py
+  become: yes
+  changed_when: false
+
+- name: Run Kibana dashboard setup script
+  command: python3 /usr/local/bin/create_kibana_dashboards.py
+  register: kibana_setup_result
+  changed_when: "'Index pattern created successfully' in kibana_setup_result.stdout or 'Index pattern already exists' in kibana_setup_result.stdout"
+  failed_when: kibana_setup_result.rc != 0
+  ignore_errors: yes
+
+- name: Display Kibana dashboards setup status
+  debug:
+    msg: "{{ kibana_setup_result.stdout_lines }}"
+  when: kibana_setup_result.stdout_lines is defined
+
+# ============================================================================
+# Phase 5.1 & 5.2: Grafana Alerting Configuration (Automated)
+# ============================================================================
+
+- name: Wait for Grafana API to be fully ready (for alert creation)
+  uri:
+    url: http://localhost:3000/api/health
+    method: GET
+    status_code: 200
+  register: grafana_health_check
+  retries: 30
+  delay: 10
+  until: grafana_health_check.status == 200
+  ignore_errors: yes
+
+- name: Copy Grafana alert creation script
+  copy:
+    src: create_grafana_alerts.py
+    dest: /usr/local/bin/create_grafana_alerts.py
+    owner: root
+    group: root
+    mode: '0755'
+  become: yes
+
+- name: Fix line endings in Grafana alert creation script (convert Windows to Unix)
+  shell: sed -i 's/\r$//' /usr/local/bin/create_grafana_alerts.py
+  become: yes
+  changed_when: false
+
+- name: Run Grafana alert creation script
+  command: python3 /usr/local/bin/create_grafana_alerts.py
+  register: grafana_alerts_result
+  changed_when: "'created successfully' in grafana_alerts_result.stdout or 'already exists' in grafana_alerts_result.stdout"
+  failed_when: grafana_alerts_result.rc != 0
+  ignore_errors: yes
+
+- name: Display Grafana alerts setup status
+  debug:
+    msg: "{{ grafana_alerts_result.stdout_lines }}"
+  when: grafana_alerts_result.stdout_lines is defined
+

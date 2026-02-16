@@ -1,0 +1,17 @@
+workflow-aggregator
+git
+gitea
+git-client
+pipeline-github-lib
+credentials
+credentials-binding
+ssh-credentials
+mailer
+matrix-auth
+job-dsl
+generic-webhook-trigger
+workflow-multibranch
+workflow-job
+workflow-cps
+workflow-api
+workflow-support

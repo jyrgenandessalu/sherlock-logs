@@ -1,0 +1,53 @@
+---
+# roles/nginx_lb/tasks/main.yml
+
+- name: Install NGINX
+  apt:
+    name: nginx
+    state: present
+    update_cache: yes
+
+- name: Create NGINX load balancer configuration
+  copy:
+    dest: /etc/nginx/sites-available/load_balancer
+    content: |
+      upstream flask_backend {
+          server 192.168.56.21:5000;
+          server 192.168.56.22:5000;
+      }
+
+      server {
+          listen 80;
+
+          location / {
+              proxy_pass http://flask_backend;
+              proxy_set_header Host $host;
+              proxy_set_header X-Real-IP $remote_addr;
+              proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+              proxy_set_header X-Forwarded-Proto $scheme;
+          }
+      }
+
+- name: Enable load balancer site
+  file:
+    src: /etc/nginx/sites-available/load_balancer
+    dest: /etc/nginx/sites-enabled/load_balancer
+    state: link
+    force: yes
+
+- name: Remove default NGINX site
+  file:
+    path: /etc/nginx/sites-enabled/default
+    state: absent
+
+- name: Test NGINX configuration
+  command: nginx -t
+  register: nginx_test
+  changed_when: false
+  failed_when: nginx_test.rc != 0
+
+- name: Restart NGINX
+  service:
+    name: nginx
+    state: restarted
+    enabled: yes

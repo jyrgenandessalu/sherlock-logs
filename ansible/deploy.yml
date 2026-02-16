@@ -1,0 +1,29 @@
+---
+# Master Ansible playbook for Sherlock-Logs
+# Runs all environment provisioning automatically
+
+- hosts: all
+  become: yes
+  roles:
+    - common
+
+- hosts: lb
+  become: yes
+  roles:
+    - nginx_lb
+
+- hosts: web
+  become: yes
+  roles:
+    - frontend_container
+
+- hosts: app
+  become: yes
+  roles:
+    - backend_container
+    - app_deploy
+
+- hosts: backup
+  become: yes
+  roles:
+    - jenkins

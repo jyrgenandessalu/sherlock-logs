@@ -1,0 +1,78 @@
+---
+# cAdvisor role
+# Installs cAdvisor as a Docker container to expose container metrics to Prometheus
+
+- name: Check if Docker is installed
+  command: which docker
+  register: docker_check
+  changed_when: false
+  failed_when: false
+
+- name: Fail if Docker is not installed
+  fail:
+    msg: "Docker is not installed on {{ ansible_hostname }}. cAdvisor requires Docker."
+  when: docker_check.rc != 0
+
+- name: Ensure Docker service is running
+  systemd:
+    name: docker
+    state: started
+    enabled: yes
+  become: yes
+
+- name: Stop any existing cAdvisor container
+  docker_container:
+    name: cadvisor
+    state: absent
+  become: yes
+  ignore_errors: yes
+
+- name: Run cAdvisor container
+  docker_container:
+    name: cadvisor
+    image: gcr.io/cadvisor/cadvisor:latest
+    state: started
+    restart_policy: always
+    ports:
+      - "8080:8080"
+    volumes:
+      - "/:/rootfs:ro"
+      - "/var/run:/var/run:ro"
+      - "/sys:/sys:ro"
+      - "/var/lib/docker/:/var/lib/docker:ro"
+      - "/dev/disk/:/dev/disk:ro"
+    privileged: true
+    detach: true
+  become: yes
+  register: cadvisor_container
+
+- name: Wait for cAdvisor to be ready
+  uri:
+    url: http://localhost:8080/metrics
+    method: GET
+    status_code: 200
+  register: cadvisor_ready
+  retries: 10
+  delay: 3
+  until: cadvisor_ready.status == 200
+  ignore_errors: yes
+
+- name: Allow cAdvisor port in UFW
+  ufw:
+    rule: allow
+    port: '8080'
+    proto: tcp
+  become: yes
+
+- name: Verify cAdvisor is running
+  uri:
+    url: http://localhost:8080/metrics
+    method: GET
+    return_content: yes
+  register: cadvisor_metrics
+  changed_when: false
+
+- name: Display cAdvisor status
+  debug:
+    msg: "cAdvisor is running on {{ ansible_hostname }} at http://{{ ansible_default_ipv4.address }}:8080"
+

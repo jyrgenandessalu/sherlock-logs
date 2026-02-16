@@ -1,0 +1,74 @@
+---
+# roles/docker/tasks/main.yml
+# Purpose: Install Docker and Docker Compose on web and app servers
+
+- name: Ensure system packages are up to date
+  apt:
+    update_cache: yes
+    upgrade: dist
+    autoremove: yes
+
+- name: Install prerequisite packages
+  apt:
+    name:
+      - apt-transport-https
+      - ca-certificates
+      - curl
+      - gnupg
+      - lsb-release
+    state: present
+
+- name: Add Docker’s official GPG key
+  apt_key:
+    url: https://download.docker.com/linux/ubuntu/gpg
+    state: present
+
+- name: Add Docker repository
+  apt_repository:
+    repo: "deb [arch=amd64] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
+    state: present
+    filename: docker
+
+- name: Install Docker Engine and Compose plugin
+  apt:
+    name:
+      - docker-ce
+      - docker-ce-cli
+      - containerd.io
+      - docker-buildx-plugin
+      - docker-compose-plugin
+    state: latest
+    update_cache: yes
+
+- name: Ensure Docker service is enabled and running
+  service:
+    name: docker
+    state: started
+    enabled: yes
+
+- name: Create docker group if not exists
+  group:
+    name: docker
+    state: present
+
+- name: Add devops user to docker group
+  user:
+    name: devops
+    groups: docker
+    append: yes
+
+- name: Enable Docker command for devops without sudo
+  copy:
+    dest: /etc/sudoers.d/docker
+    content: "devops ALL=(ALL) NOPASSWD: /usr/bin/docker\n"
+    owner: root
+    group: root
+    mode: '0440'
+
+- name: Verify Docker installation
+  command: docker --version
+  register: docker_version
+  changed_when: false
+
+- debug:
+    msg: "Docker successfully installed: {{ docker_version.stdout }}"

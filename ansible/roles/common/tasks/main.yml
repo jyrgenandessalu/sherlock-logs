@@ -1,0 +1,253 @@
+---
+# Common setup for all VMs (tasks main.yml)
+# Includes retry logic for apt, idempotency, and safe firewall setup
+
+- name: Synchronize VM clock (fixes apt "Release file not valid yet" errors)
+  shell: |
+    # Try ntpdate first (if available), fallback to timedatectl
+    if command -v ntpdate >/dev/null 2>&1; then
+      ntpdate -s time.nist.gov || ntpdate -s pool.ntp.org || true
+    fi
+    # Enable and sync with systemd-timesyncd
+    timedatectl set-ntp true || true
+    # Force a sync
+    systemctl restart systemd-timesyncd || true
+  become: yes
+  ignore_errors: yes
+  changed_when: false
+  register: clock_sync
+  failed_when: false
+
+- name: Update and upgrade system packages (with retries and safe handling)
+  block:
+    - name: Refresh apt cache and upgrade system
+      apt:
+        update_cache: yes
+        upgrade: dist
+        autoremove: yes
+      register: apt_result
+      until: apt_result is succeeded
+      retries: 5
+      delay: 30
+  rescue:
+    - name: Fallback - clean apt cache and retry update
+      shell: |
+        apt-get clean
+        rm -rf /var/lib/apt/lists/*
+        apt-get update -y
+        apt-get dist-upgrade -y
+      register: apt_retry
+      until: apt_retry.rc == 0
+      retries: 3
+      delay: 20
+
+- name: Ensure devops user exists
+  user:
+    name: devops
+    comment: DevOps user for automation
+    shell: /bin/bash
+    create_home: yes
+    groups: sudo
+    append: yes
+    state: present
+
+- name: Set password for devops user (for sudo password requirement)
+  shell: |
+    echo 'devops:devops' | chpasswd
+  become: yes
+  no_log: true
+
+- name: Create .ssh directory for devops
+  file:
+    path: /home/devops/.ssh
+    state: directory
+    owner: devops
+    group: devops
+    mode: '0700'
+
+- name: Generate SSH keypair for devops (automated)
+  openssh_keypair:
+    path: /home/devops/.ssh/id_rsa
+    owner: devops
+    group: devops
+    mode: '0600'
+    type: rsa
+    size: 4096
+    state: present
+  register: keypair
+
+- name: Add devops public key to authorized_keys
+  authorized_key:
+    user: devops
+    state: present
+    key: "{{ keypair.public_key }}"
+
+- name: Disable root login
+  lineinfile:
+    path: /etc/ssh/sshd_config
+    regexp: '^#?PermitRootLogin'
+    line: 'PermitRootLogin no'
+  notify: restart ssh
+
+- name: Disable password authentication
+  lineinfile:
+    path: /etc/ssh/sshd_config
+    regexp: '^#?PasswordAuthentication'
+    line: 'PasswordAuthentication no'
+  notify: restart ssh
+
+- name: Set secure umask
+  lineinfile:
+    path: /etc/profile
+    regexp: '^umask'
+    line: 'umask 027'
+
+- name: Configure UFW firewall securely
+  block:
+    # SSH access from anywhere (required for management)
+    - name: Allow SSH from anywhere
+      ufw:
+        rule: allow
+        port: '22'
+        proto: tcp
+
+    # Load balancer: Allow HTTP from anywhere (external access)
+    - name: Allow HTTP on load balancer (external access)
+      ufw:
+        rule: allow
+        port: '80'
+        proto: tcp
+      when: "'lb' in group_names"
+
+    # Web and App servers: Allow port 5000 ONLY from load balancer
+    # Docker bypasses UFW, so we need to use iptables directly in DOCKER-USER chain
+    - name: Remove existing port 5000 rule (if any) on web/app servers
+      shell: |
+        ufw delete allow 5000/tcp 2>/dev/null || true
+      become: yes
+      when: "'web' in group_names or 'app' in group_names"
+      ignore_errors: yes
+
+    # Add UFW rule (for non-Docker services, if any)
+    # Allow from load balancer (for application traffic)
+    - name: Allow application port on web/app servers from LB - UFW rule
+      shell: |
+        ufw allow from 192.168.56.20 to any port 5000 proto tcp
+      become: yes
+      when: "'web' in group_names or 'app' in group_names"
+
+    # Allow from monitoring server (for Prometheus metrics scraping)
+    - name: Allow application port on web/app servers from monitoring - UFW rule
+      shell: |
+        ufw allow from 192.168.56.25 to any port 5000 proto tcp
+      become: yes
+      when: "'web' in group_names or 'app' in group_names"
+
+    # Docker bypasses UFW, so we need iptables rules in DOCKER-USER chain
+    # This chain is processed before Docker's own rules
+    # Create DOCKER-USER chain if it doesn't exist (Docker creates it when it starts, but we need it earlier)
+    - name: Ensure DOCKER-USER chain exists (create if Docker not installed yet)
+      shell: |
+        # Check if chain exists, create if not
+        if ! iptables -t filter -L DOCKER-USER >/dev/null 2>&1; then
+          iptables -t filter -N DOCKER-USER
+          # Set default policy to RETURN (let packets continue to next chain)
+          iptables -t filter -A DOCKER-USER -j RETURN
+        fi
+      become: yes
+      when: "'web' in group_names or 'app' in group_names"
+      ignore_errors: yes
+
+    # Remove any existing rules for port 5000 first to avoid duplicates
+    - name: Remove existing Docker iptables rules for port 5000
+      shell: |
+        iptables -D DOCKER-USER -p tcp --dport 5000 -j DROP 2>/dev/null || true
+        iptables -D DOCKER-USER -p tcp -s 192.168.56.20 --dport 5000 -j ACCEPT 2>/dev/null || true
+      become: yes
+      when: "'web' in group_names or 'app' in group_names"
+      ignore_errors: yes
+
+    # Add allow rules first (higher priority), then drop rule
+    # Allow from load balancer (for application traffic)
+    - name: Allow port 5000 from load balancer (Docker iptables rule)
+      shell: |
+        iptables -I DOCKER-USER 1 -p tcp -s 192.168.56.20 --dport 5000 -j ACCEPT
+      become: yes
+      when: "'web' in group_names or 'app' in group_names"
+
+    # Allow from monitoring server (for Prometheus metrics scraping)
+    - name: Allow port 5000 from monitoring server (Docker iptables rule)
+      shell: |
+        iptables -I DOCKER-USER 2 -p tcp -s 192.168.56.25 --dport 5000 -j ACCEPT
+      become: yes
+      when: "'web' in group_names or 'app' in group_names"
+
+    - name: Block port 5000 from all other sources (Docker iptables rule)
+      shell: |
+        iptables -I DOCKER-USER 3 -p tcp --dport 5000 -j DROP
+      become: yes
+      when: "'web' in group_names or 'app' in group_names"
+
+    # Save iptables rules to make them persistent
+    - name: Install iptables-persistent (for saving rules)
+      apt:
+        name: iptables-persistent
+        state: present
+      become: yes
+      when: "'web' in group_names or 'app' in group_names"
+
+    - name: Save iptables rules
+      shell: |
+        netfilter-persistent save || iptables-save > /etc/iptables/rules.v4
+      become: yes
+      when: "'web' in group_names or 'app' in group_names"
+      ignore_errors: yes
+
+    # Set default incoming policy to deny
+    - name: Set default incoming policy to deny
+      ufw:
+        direction: incoming
+        policy: deny
+
+    # Enable UFW via systemd service (avoids hanging during provisioning)
+    # Create a systemd service that enables UFW on boot, but don't start it now
+    - name: Create systemd service to enable UFW on boot
+      copy:
+        dest: /etc/systemd/system/enable-ufw.service
+        content: |
+          [Unit]
+          Description=Enable UFW Firewall
+          After=network.target
+          
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/sbin/ufw --force enable
+          RemainAfterExit=yes
+          
+          [Install]
+          WantedBy=multi-user.target
+        mode: '0644'
+      become: yes
+
+    - name: Reload systemd and enable UFW service (don't start - avoids hanging)
+      systemd:
+        name: enable-ufw
+        enabled: yes
+        daemon_reload: yes
+      become: yes
+      # Don't start the service - it will start on next boot
+      # This avoids hanging during provisioning
+      # Note: UFW rules are configured, and UFW will be enabled automatically on boot
+
+    # Enable UFW immediately for web/app servers (these worked before, lb/backup can wait for boot)
+    - name: Enable UFW for web/app servers immediately
+      shell: 'ufw --force enable'
+      become: yes
+      when: "'web' in group_names or 'app' in group_names"
+      args:
+        executable: /bin/bash
+      ignore_errors: yes
+      changed_when: false
+
+
+
